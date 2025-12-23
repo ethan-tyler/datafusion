@@ -20,6 +20,7 @@
 //! This parser implements DataFusion specific statements such as
 //! `CREATE EXTERNAL TABLE`
 
+use chrono::{DateTime, NaiveDateTime};
 use datafusion_common::config::SqlParserOptions;
 use datafusion_common::DataFusionError;
 use datafusion_common::{sql_err, Diagnostic, Span};
@@ -401,6 +402,7 @@ impl<'a> DFParserBuilder<'a> {
         let tokens = tokenizer
             .tokenize_with_location()
             .map_err(ParserError::from)?;
+        let tokens = rewrite_time_travel_tokens(tokens)?;
 
         Ok(DFParser {
             parser: Parser::new(self.dialect)
@@ -411,6 +413,275 @@ impl<'a> DFParserBuilder<'a> {
                 ..Default::default()
             },
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimeTravelKind {
+    Version,
+    Timestamp,
+}
+
+fn rewrite_time_travel_tokens(
+    tokens: Vec<TokenWithSpan>,
+) -> Result<Vec<TokenWithSpan>, DataFusionError> {
+    let mut rewritten = Vec::with_capacity(tokens.len());
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        if let Some((object_end, last_ident_idx)) = parse_object_name(&tokens, idx) {
+            if let Some((suffix, next_idx)) =
+                parse_time_travel_suffix(&tokens, object_end + 1)?
+            {
+                for token_idx in idx..=object_end {
+                    if token_idx == last_ident_idx {
+                        rewritten.push(apply_time_travel_suffix(
+                            &tokens[token_idx],
+                            &suffix,
+                        )?);
+                    } else {
+                        rewritten.push(tokens[token_idx].clone());
+                    }
+                }
+                idx = next_idx;
+                continue;
+            }
+        }
+
+        rewritten.push(tokens[idx].clone());
+        idx += 1;
+    }
+
+    Ok(rewritten)
+}
+
+fn parse_object_name(tokens: &[TokenWithSpan], start: usize) -> Option<(usize, usize)> {
+    let mut idx = start;
+    let mut last_ident_idx = None;
+
+    if !matches!(tokens.get(idx)?.token, Token::Word(_)) {
+        return None;
+    }
+
+    loop {
+        match tokens.get(idx)?.token {
+            Token::Word(_) => {
+                last_ident_idx = Some(idx);
+                idx += 1;
+            }
+            _ => return None,
+        }
+
+        let mut probe = idx;
+        while matches!(
+            tokens.get(probe).map(|t| &t.token),
+            Some(Token::Whitespace(_))
+        ) {
+            probe += 1;
+        }
+
+        if matches!(tokens.get(probe).map(|t| &t.token), Some(Token::Period)) {
+            idx = probe + 1;
+            while matches!(
+                tokens.get(idx).map(|t| &t.token),
+                Some(Token::Whitespace(_))
+            ) {
+                idx += 1;
+            }
+            continue;
+        }
+
+        return Some((last_ident_idx?, last_ident_idx?));
+    }
+}
+
+fn parse_time_travel_suffix(
+    tokens: &[TokenWithSpan],
+    start: usize,
+) -> Result<Option<(String, usize)>, DataFusionError> {
+    let Some(kind_idx) = next_non_whitespace_index(tokens, start) else {
+        return Ok(None);
+    };
+
+    let Some(kind) = parse_time_travel_kind(tokens.get(kind_idx)) else {
+        return Ok(None);
+    };
+
+    let Some(as_idx) = next_non_whitespace_index(tokens, kind_idx + 1) else {
+        return Ok(None);
+    };
+    let Some(of_idx) = next_non_whitespace_index(tokens, as_idx + 1) else {
+        return Ok(None);
+    };
+    if !token_is_keyword(tokens.get(as_idx), "AS")
+        || !token_is_keyword(tokens.get(of_idx), "OF")
+    {
+        return Ok(None);
+    }
+
+    let Some(value_idx) = next_non_whitespace_index(tokens, of_idx + 1) else {
+        return parser_err!(format!(
+            "Expected value after {} AS OF",
+            match kind {
+                TimeTravelKind::Version => "VERSION",
+                TimeTravelKind::Timestamp => "TIMESTAMP",
+            }
+        ));
+    };
+    let (value, next_idx) = parse_time_travel_value(tokens, value_idx, kind)?;
+    let suffix = match (kind, value) {
+        (TimeTravelKind::Version, TimeTravelValue::Int(snapshot_id)) => {
+            format!("@v{snapshot_id}")
+        }
+        (TimeTravelKind::Timestamp, TimeTravelValue::Int(timestamp_ms)) => {
+            format!("@ts{timestamp_ms}")
+        }
+        (TimeTravelKind::Timestamp, TimeTravelValue::Str(value)) => {
+            let timestamp_ms = parse_timestamp_literal(&value)?;
+            format!("@ts{timestamp_ms}")
+        }
+        (TimeTravelKind::Version, TimeTravelValue::Str(_)) => {
+            return parser_err!(
+                "Invalid VERSION AS OF value: expected integer snapshot id"
+            );
+        }
+    };
+
+    Ok(Some((suffix, next_idx)))
+}
+
+fn parse_time_travel_kind(token: Option<&TokenWithSpan>) -> Option<TimeTravelKind> {
+    let token = token?;
+    if token_is_keyword(Some(token), "VERSION") {
+        Some(TimeTravelKind::Version)
+    } else if token_is_keyword(Some(token), "TIMESTAMP") {
+        Some(TimeTravelKind::Timestamp)
+    } else {
+        None
+    }
+}
+
+fn next_non_whitespace_index(tokens: &[TokenWithSpan], mut idx: usize) -> Option<usize> {
+    while let Some(token) = tokens.get(idx) {
+        if !matches!(token.token, Token::Whitespace(_)) {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn token_is_keyword(token: Option<&TokenWithSpan>, keyword: &str) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    match &token.token {
+        Token::Word(word) => {
+            word.quote_style.is_none() && word.value.eq_ignore_ascii_case(keyword)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TimeTravelValue {
+    Int(i64),
+    Str(String),
+}
+
+fn parse_time_travel_value(
+    tokens: &[TokenWithSpan],
+    start: usize,
+    kind: TimeTravelKind,
+) -> Result<(TimeTravelValue, usize), DataFusionError> {
+    let token = tokens
+        .get(start)
+        .ok_or_else(|| DataFusionError::from(ParserError::ParserError(format!(
+            "Expected value after {} AS OF",
+            match kind {
+                TimeTravelKind::Version => "VERSION",
+                TimeTravelKind::Timestamp => "TIMESTAMP",
+            }
+        ))))?;
+
+    match &token.token {
+        Token::Minus => {
+            let Some(next_idx) = next_non_whitespace_index(tokens, start + 1)
+            else {
+                return parser_err!("Expected integer literal after '-'");
+            };
+            if let Token::Number(value, _) = &tokens[next_idx].token {
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    DataFusionError::from(ParserError::ParserError(
+                        "Invalid integer literal for time travel".to_string(),
+                    ))
+                })?;
+                return Ok((TimeTravelValue::Int(-parsed), next_idx + 1));
+            }
+        }
+        Token::Number(value, _) => {
+            let parsed = value.parse::<i64>().map_err(|_| {
+                DataFusionError::from(ParserError::ParserError(
+                    "Invalid integer literal for time travel".to_string(),
+                ))
+            })?;
+            return Ok((TimeTravelValue::Int(parsed), start + 1));
+        }
+        Token::SingleQuotedString(value)
+        | Token::EscapedStringLiteral(value)
+        | Token::NationalStringLiteral(value)
+        | Token::UnicodeStringLiteral(value)
+        | Token::DoubleQuotedString(value) => {
+            return Ok((TimeTravelValue::Str(value.clone()), start + 1));
+        }
+        _ => {}
+    }
+
+    parser_err!(format!(
+        "Invalid {} AS OF value: expected integer or string literal",
+        match kind {
+            TimeTravelKind::Version => "VERSION",
+            TimeTravelKind::Timestamp => "TIMESTAMP",
+        }
+    ))
+}
+
+fn parse_timestamp_literal(value: &str) -> Result<i64, DataFusionError> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.timestamp_millis());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+    {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+    {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+
+    parser_err!(format!(
+        "Invalid TIMESTAMP AS OF value: '{value}' (expected RFC3339 or '%Y-%m-%d %H:%M:%S[.fff]')"
+    ))
+}
+
+fn apply_time_travel_suffix(
+    token: &TokenWithSpan,
+    suffix: &str,
+) -> Result<TokenWithSpan, DataFusionError> {
+    match &token.token {
+        Token::Word(word) => {
+            let quote_style = word.quote_style.or(Some('"'));
+            let updated = Word {
+                value: format!("{}{}", word.value, suffix),
+                quote_style,
+                keyword: Keyword::NoKeyword,
+            };
+            Ok(TokenWithSpan {
+                token: Token::Word(updated),
+                span: token.span,
+            })
+        }
+        _ => parser_err!("Expected table identifier before VERSION/TIMESTAMP AS OF"),
     }
 }
 
